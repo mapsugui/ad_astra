@@ -17,15 +17,16 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .lightcurve import (contiguous_runs, in_veto, local_resid, phase_of, read_spoc, robust_sigma,
+from .lightcurve import (contiguous_runs, in_veto, local_resid, phase_of, read_campaign_lc, read_spoc, robust_sigma,
                          screen_events)
+from . import systematics
 
 MAST_DOWNLOAD = "https://mast.stsci.edu/api/v0.1/Download/file?uri=mast%3ATESS%2Fproduct%2F{pid}"
 
 
 def portable(path: Path) -> str:
     """Store scratch paths as ``scratch:<relative>`` so saved outputs carry no machine-specific paths."""
-    from ..config import scratch_dir
+    from cygnus.config import scratch_dir
 
     root = scratch_dir().resolve()
     try:
@@ -35,7 +36,7 @@ def portable(path: Path) -> str:
 
 
 def resolve(stored: str) -> Path:
-    from ..config import scratch_dir
+    from cygnus.config import scratch_dir
 
     return scratch_dir() / stored[8:] if stored.startswith("scratch:") else Path(stored)
 
@@ -46,16 +47,6 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _excluded(ctx) -> dict | None:
-    """The ``fetch_products`` result when it found nothing (a documented exclusion), else None.
-
-    A target with no available products is a recorded null, not a red run: steps that need
-    products leave their checks ``not_tested`` with the exclusion note instead of raising.
-    """
-    res = ctx.optional_result("fetch_products", {}) or {}
-    return res if res.get("excluded") else None
 
 
 # ------------------------------------------------------------------ products
@@ -88,30 +79,120 @@ def _discover_spoc_lcs(tic: int, max_products: int, t0_bjd: float | None = None)
     return out[:max_products]
 
 
+def _read_lc(path, prod: dict):
+    """Read a fetched product into the screen's light-curve shape, honouring its archive format.
+
+    A pinned/discovered SPOC product keeps the exact old reader; anything from a
+    non-MAST archive goes through the generic reader, which records which columns
+    became SAP and PDCSAP.
+    """
+    fmt = prod.get("format") or "spoc_lc"
+    if fmt in ("spoc_lc", "tess_lc") and prod.get("archive") in (None, "MAST"):
+        try:
+            return read_spoc(path)
+        except ValueError:
+            pass   # fall through to the generic reader
+    return read_campaign_lc(path, fmt=fmt)
+
+
+def _discover_via_adapters(ctx, t: dict, opts: dict) -> list[dict]:
+    """Discover products for one target from every archive named in ``opts['archives']``.
+
+    Returns a flat list of product dicts ready for the fetch loop. Each names its
+    archive and format so the download and read paths can dispatch correctly. An
+    archive that cannot be queried is recorded as a note (not tested), never as an
+    empty result.
+    """
+    from .archives import base as _base
+
+    names = opts.get("archives")
+    if not names:
+        return []
+    target = _base.Target.from_mapping({**t, **{k: opts.get(k) for k in
+                                                 ("t0_bjd", "period_days", "depth_ppm", "duration_h") if opts.get(k) is not None}})
+    out = []
+    for name in names:
+        try:
+            adapter = _base.get(name)
+        except KeyError:
+            ctx.note(f"{t['name']}: archive adapter {name!r} is not registered; skipped.")
+            continue
+        per = dict(opts.get("options", {}).get(name, {}))
+        if not adapter.row_limited:
+            # a product count; catalogue adapters read ``limit`` as a TOP row cap and keep their own default
+            per.setdefault("limit", int(opts.get("max_products_per_target", 3)))
+        try:
+            refs = adapter.discover(target, **per)
+        except _base.AdapterUnavailable as exc:
+            ctx.note(f"{t['name']}/{name}: archive unavailable — {exc}")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            ctx.note(f"{t['name']}/{name}: discovery failed — {type(exc).__name__}: {exc}")
+            continue
+        row_cap = None
+        if adapter.row_limited:
+            import inspect
+
+            row_cap = per.get("limit", inspect.signature(adapter.discover).parameters["limit"].default)
+        for ref in refs:
+            d = ref.as_dict()
+            rows = (d.get("extra") or {}).get("rows")
+            if row_cap is not None and isinstance(rows, list) and len(rows) >= int(row_cap):
+                d["truncated"] = f"{len(rows)} rows returned = the TOP {row_cap} cap; the table may be incomplete"
+                ctx.note(f"{t['name']}/{name}: {ref.product_id} hit the TOP {row_cap} row cap; the table may be incomplete.")
+            # flatten the adapter's extra fields (inline rows, ZTF cone parameters, sector, ...) so the fetch
+            # loop hands them back to adapter.fetch as ProductRef.extra, not nested one level deeper
+            for k, v in d.pop("extra", {}).items():
+                d.setdefault(k, v)
+            d["target"] = t["name"]
+            d["tic"] = t.get("tic")
+            d["archive"] = ref.archive
+            out.append(d)
+    return out
+
+
 def step_fetch_products(ctx, params: dict) -> dict:
     """Locate or download each product, verify it, and register it in the ledger.
 
     Pinned products (``input.products`` with ``expected_sha256``) must match exactly. Products
-    discovered from a target queue are recorded with the SHA-256 of their first retrieval.
+    discovered from a target queue are recorded with the SHA-256 of their first retrieval. Products
+    may come from any registered archive (``from_targets.archives``/``from_queue.archives``); MAST
+    SPOC light curves keep their original discovery path when no archives are named.
     """
-    from ..ingest.netio import fetch_to_file
+    from cygnus.ingest.netio import fetch_to_file
+
+    from .archives import base as _base
 
     wanted = [dict(p) for p in ctx.spec.get("input", {}).get("products", [])]
+    for p in wanted:
+        p.setdefault("archive", "MAST")
+        p.setdefault("format", "spoc_lc")
+        p.setdefault("kind", _base.kind_for_format(p["format"]))
     q = params.get("from_queue")
     pool = []
     if q:
         pool += [(t, q) for t in ctx.result("target_queue")["queue"][: int(q.get("top", 5))]]
     ft = params.get("from_targets")
     if ft:
-        pool += [(t, ft) for t in ctx.spec.get("targets", []) if t.get("tic")]
+        pool += [(t, ft) for t in ctx.spec.get("targets", []) if t.get("tic") or ft.get("archives")]
     for t, opts in pool:
-        found = _discover_spoc_lcs(int(t["tic"]), int(opts.get("max_products_per_target", 2)), t.get("t0_bjd"))
-        if not found:
-            ctx.note(f"{t['name']}: no SPOC 120-s light curve found at MAST for TIC {t['tic']}.")
-        for p in found:
-            p["target"] = t["name"]
-            wanted.append(p)
-    from ..config import scratch_dir
+        # explicit archive selection goes through adapters; otherwise keep the MAST SPOC path
+        if opts.get("archives"):
+            found = _discover_via_adapters(ctx, t, opts)
+            if not found:
+                ctx.note(f"{t['name']}: no products discovered from archives {opts['archives']}.")
+            wanted.extend(found)
+        elif t.get("tic"):
+            found = _discover_spoc_lcs(int(t["tic"]), int(opts.get("max_products_per_target", 2)), t.get("t0_bjd"))
+            if not found:
+                ctx.note(f"{t['name']}: no SPOC 120-s light curve found at MAST for TIC {t['tic']}.")
+            for p in found:
+                p["target"] = t["name"]
+                p["archive"] = "MAST"
+                p["format"] = "spoc_lc"
+                p["kind"] = "lightcurve"
+                wanted.append(p)
+    from cygnus.config import scratch_dir
 
     # "scratch:<subdir>" keeps machine-specific paths out of committed specs
     dirs = [ctx.scratch] + [scratch_dir(d[8:]) if str(d).startswith("scratch:") else Path(d)
@@ -119,33 +200,110 @@ def step_fetch_products(ctx, params: dict) -> dict:
     out = {}
     for p in wanted:
         pid = p["product_id"]
-        path = next((d / pid for d in dirs if (d / pid).is_file()), None)
+        archive = p.get("archive") or "MAST"
+        fmt = p.get("format") or "spoc_lc"
+        # namespace scratch file names by archive so same-named products cannot collide
+        fname = pid if archive == "MAST" else f"{archive}__{pid}"
+        # an inline product is a query result carried by discovery: always rewrite it, so a cached file from an
+        # earlier (different or truncated) query is never reused under the same name
+        path = None if p.get("inline") else next((d / fname for d in dirs if (d / fname).is_file()), None)
         fetched = False
         if path is None:
-            path = ctx.scratch / pid
-            fetch_to_file(MAST_DOWNLOAD.format(pid=pid), path, timeout_s=120)
+            path = ctx.scratch / fname
+            url = p.get("url")
+            if archive.upper() == "MAST" and not url:
+                url = MAST_DOWNLOAD.format(pid=pid)
+            try:
+                adapter = _base.get(archive.lower() if archive.lower() in _base.available() else archive)
+            except KeyError:
+                adapter = None
+            # a bare MAST product with no explicit URL keeps the original downloader
+            if url and (archive.upper() == "MAST" or adapter is None):
+                fetch_to_file(url, path, timeout_s=120)
+            elif adapter is not None:
+                extra = {k: v for k, v in p.items()
+                         if k not in ("product_id", "url", "format", "expected_sha256", "description", "target")}
+                try:
+                    adapter.fetch(_base.ProductRef(archive=archive, product_id=pid, url=url, format=fmt,
+                                                   expected_sha256=p.get("expected_sha256"), extra=extra),
+                                  path, timeout_s=120)
+                except _base.AdapterUnavailable as exc:
+                    # e.g. observing routes (a request queue, nothing archived yet): a note, not a crash
+                    ctx.note(f"{p.get('target') or pid}/{archive}: not fetched — {exc}")
+                    continue
+            else:
+                raise RuntimeError(f"{pid}: no URL and no adapter for archive {archive!r}")
             fetched = True
         digest, size = _sha256(path), path.stat().st_size
         if p.get("expected_sha256") and (digest != p["expected_sha256"] or
                                          (p.get("expected_bytes") and size != int(p["expected_bytes"]))):
             raise RuntimeError(f"{pid}: checksum/size mismatch (sha256 {digest}, {size} bytes); refusing to analyse")
-        if not ctx.ledger_has_product("MAST", pid):
-            ctx.ledger.add_product("MAST", pid, url=MAST_DOWNLOAD.format(pid=pid), local_path=path, checksum=digest,
-                                   license_="public MAST", extra={"campaign": ctx.campaign_id, "tic": p.get("tic"),
-                                                                  "sector": p.get("sector")})
+        if not ctx.ledger_has_product(archive, pid):
+            ledger_url = p.get("url") or (MAST_DOWNLOAD.format(pid=pid) if archive.upper() == "MAST" else None)
+            ctx.ledger.add_product(archive, pid, url=ledger_url, local_path=path,
+                                   checksum=digest, license_=p.get("license", "see DATA_SOURCES.md"),
+                                   extra={"campaign": ctx.campaign_id, "tic": p.get("tic"),
+                                          "sector": p.get("sector"), "format": fmt})
         out[pid] = {"path": portable(path), "sha256": digest, "bytes": size, "fetched_now": fetched,
                     "pinned": bool(p.get("expected_sha256")), "target": p.get("target"), "tic": p.get("tic"),
-                    "sector": p.get("sector"), "covers_known_epoch": p.get("covers_known_epoch")}
+                    "sector": p.get("sector"), "covers_known_epoch": p.get("covers_known_epoch"),
+                    "archive": archive, "format": fmt, "url": p.get("url"),
+                    "kind": p.get("kind") or _base.kind_for_format(fmt),
+                    "description": p.get("description", ""),
+                    **({"truncated": p["truncated"]} if p.get("truncated") else {})}
     if not out:
-        note = "no products to analyse: none pinned and none found at MAST for the requested targets"
-        ctx.note(note)
-        ctx.check("Product integrity (SHA-256)", "not_tested", note)
-        ctx.outcome = ("pipeline_check", None)   # a no-data target is a pipeline outcome, not a bound
-        return {"products": {}, "excluded": True, "exclusion": note}
+        detail = "; ".join(ctx.notes[-4:]) if ctx.notes else "no archives produced a product"
+        raise RuntimeError(f"no products to analyse (none pinned, none discovered) — {detail}")
+    archives = sorted({v["archive"] for v in out.values()})
+    # the residual screen needs a densely sampled series: an empty or sparse/irregular light curve
+    # (e.g. a ZTF magnitude series of a bright star) stays a fetched product but is not screened
+    min_usable = int(params.get("min_usable_cadences", 100))
+    max_cadence = float(params.get("max_cadence_s", 1800.0))
+    unsuitable = {}
+    for pid, v in out.items():
+        if v["kind"] != "lightcurve":
+            continue
+        try:
+            lc = _read_lc(resolve(v["path"]), v)
+            n_ok, cad = int(lc.usable.sum()), float(lc.cadence_s)
+            why = (f"{n_ok} usable cadence(s) < {min_usable}" if n_ok < min_usable else
+                   f"cadence {cad:.0f} s > {max_cadence:.0f} s (sparse/irregular sampling; the contiguous-cadence "
+                   "screen does not apply)" if cad > max_cadence else None)
+            v["screen_suitability"] = {"usable_cadences": n_ok, "cadence_s": cad, "screenable": why is None,
+                                       **({"reason": why} if why else {})}
+        except Exception as exc:  # noqa: BLE001 - an unreadable product is reported, not screened
+            why = f"unreadable as a light curve: {type(exc).__name__}: {str(exc)[:160]}"
+            v["screen_suitability"] = {"screenable": False, "reason": why}
+        if why:
+            unsuitable[pid] = why
+            ctx.note(f"{pid}: not screened — {why}.")
+    lightcurves = [pid for pid, v in out.items() if v["kind"] == "lightcurve" and pid not in unsuitable]
+    if any(v["kind"] == "lightcurve" for v in out.values()):
+        ctx.check("Light-curve suitability for the residual screen", "passed" if not unsuitable else "inconclusive",
+                  f"{len(lightcurves)} light curve(s) screenable"
+                  + (f"; {len(unsuitable)} excluded: " + "; ".join(f"{k}: {w}" for k, w in list(unsuitable.items())[:3])
+                     if unsuitable else ""))
     ctx.check("Product integrity (SHA-256)", "passed",
-              f"{len(out)} product(s) verified; pinned checksums matched" if any(v["pinned"] for v in out.values())
-              else f"{len(out)} product(s) checksummed at first retrieval")
-    return {"products": out}
+              f"{len(out)} product(s) from {', '.join(archives)} verified; pinned checksums matched"
+              if any(v["pinned"] for v in out.values())
+              else f"{len(out)} product(s) from {', '.join(archives)} checksummed at first retrieval")
+    if not lightcurves:
+        ctx.note("No light-curve product was retrieved; only image/table/text products are available to screen.")
+    return {"products": out, "lightcurve_products": lightcurves}
+
+
+def _lightcurve_products(ctx) -> dict[str, dict]:
+    """The fetched products that are analysable time series, keyed by product id.
+
+    Image, table and text products are context only; the screen steps never try to
+    read them as light curves. Falling back to all products keeps old specs, whose
+    entries predate the ``kind`` field, working.
+    """
+    prods = ctx.result("fetch_products")["products"]
+    lc = ctx.optional_result("fetch_products", {}).get("lightcurve_products")
+    if lc is None:
+        return prods
+    return {pid: prods[pid] for pid in lc if pid in prods}
 
 
 # ------------------------------------------------------------------ veto windows
@@ -174,9 +332,32 @@ def _target_for(ctx, pid: str) -> dict | None:
     return None
 
 
-def group_entries(entries: list[dict], n_windows: int) -> list[dict]:
+def _channel_info(lc) -> dict:
+    return (getattr(lc, "primary", None) or {}).get("_channels", {})
+
+
+def _independent(lc) -> bool:
+    """Whether the two channels are genuinely different reductions.
+
+    A single-channel archive product (e.g. a CSV with one flux column) is read with
+    ``sap == pdc`` and ``independent=False``; the screen then treats it as one
+    channel and says so, instead of pretending to have an independent check.
+    """
+    return bool(_channel_info(lc).get("independent", True))
+
+
+def _screen_channels(lc):
+    """The (label, flux) pairs to screen: SAP+PDCSAP when independent, else the single channel."""
+    if _independent(lc):
+        return (("SAP", lc.sap), ("PDCSAP", lc.pdc))
+    return ((_channel_info(lc).get("pdc") or "FLUX", lc.pdc),)
+
+
+def group_entries(entries: list[dict], n_windows: int, *, single_channel: bool = False) -> list[dict]:
     """Merge screen entries that overlap in time (entries repeat across baselines and flux types)
-    into distinct events. ``persistent`` = seen in SAP and PDCSAP at two or more baselines."""
+    into distinct events. ``persistent`` = seen in SAP and PDCSAP at two or more baselines; for a
+    single-channel product persistence is only repeatability across baselines, and is labelled so.
+    """
     out = []
     for e in sorted(entries, key=lambda e: e["start_time_stored"]):
         if out and e["start_time_stored"] <= out[-1]["_end"]:
@@ -190,13 +371,32 @@ def group_entries(entries: list[dict], n_windows: int) -> list[dict]:
         es = g["entries"]
         deepest = min(es, key=lambda e: e["median_fractional_residual"])
         fl, bl = sorted({e["flux_type"] for e in es}), sorted({e["detrend_days"] for e in es})
+        enough_baselines = len(bl) >= min(2, n_windows)
+        persistent = (enough_baselines and fl == ["PDCSAP", "SAP"]) or (single_channel and enough_baselines)
         events.append({"mid_time_BJD_like": deepest["mid_time_BJD_like"], "deepest_median_residual": deepest["median_fractional_residual"],
-                       "max_cadences": max(e["n_cadences"] for e in es), "flux_types": fl, "baselines_days": bl,
-                       "n_entries": len(es), "persistent": fl == ["PDCSAP", "SAP"] and len(bl) >= min(2, n_windows)})
+                       "max_cadences": max(e["n_cadences"] for e in es), "span_days": float(g["_end"] - g["_start"]),
+                       "flux_types": fl, "baselines_days": bl,
+                       "n_entries": len(es), "persistent": persistent,
+                       "persistence_basis": "baseline repeatability (single channel; not independent)" if single_channel
+                                            else "SAP and PDCSAP at >=2 baselines"})
     return events
 
 
 # ------------------------------------------------------------------ residual screen
+def significance_state(fap: float, empirical_p: float, n_random: int) -> tuple[str, bool]:
+    """Check state for a single-channel event's red-noise significance.
+
+    ``passed`` needs both the parametric trial-corrected FAP ≤ 0.01 *and* empirical agreement (at
+    most one random epoch of the same light curve as deep as the event): the parametric value is a
+    Gaussian tail and alone cannot pass an event. FAP ≤ 0.1, or a parametric pass the empirical
+    test does not confirm, is ``inconclusive``; otherwise ``failed``.
+    """
+    agrees = empirical_p <= 2.0 / (n_random + 1)
+    if fap <= 0.01 and agrees:
+        return "passed", agrees
+    return ("inconclusive" if fap <= 0.1 else "failed"), agrees
+
+
 def _threshold(ctx, pid: str, k_param) -> tuple[float, str]:
     """The screen threshold for one light curve and where it came from. ``calibrated`` uses
     calibrate_screen's k*; when no grid value reached the null-event limit the declared k is used
@@ -216,23 +416,20 @@ def _threshold(ctx, pid: str, k_param) -> tuple[float, str]:
 def step_residual_screen(ctx, params: dict) -> dict:
     """Negative excursions ≥ k robust-MAD, ≥ min_cadences, SAP and PDCSAP, several baselines,
     outside the known-signal veto. Writes screen.json and normalized_series.csv per product."""
-    if (ex := _excluded(ctx)):
-        ctx.check("Calibrated false-alarm threshold (sign-flip null)", "not_tested", ex["exclusion"])
-        ctx.check("Synthetic signal injection–recovery", "not_tested", ex["exclusion"])
-        return {"per_product": {}, "entries_outside_veto_total": 0, "distinct_events_outside_veto_total": 0,
-                "persistent_events_outside_veto_total": 0, "excluded": True}
     veto = ctx.spec.get("veto")
     windows = tuple(params.get("windows_days", (1.0, 2.0, 3.0)))
     k_decl = params.get("k_mad", 5.0)
     summary = {}
-    for pid, prod in ctx.result("fetch_products")["products"].items():
-        lc = read_spoc(resolve(prod["path"]))
+    for pid, prod in _lightcurve_products(ctx).items():
+        lc = _read_lc(resolve(prod["path"]), prod)
         k, k_src = _threshold(ctx, pid, k_decl)
         target = _target_for(ctx, pid)
         vmask, ph = _veto_mask(lc, veto, target)
         finite = lc.usable
+        single = not _independent(lc)
         events = []
-        for e in screen_events(lc, windows_days=windows, k_mad=k, min_cadences=int(params.get("min_cadences", 2))):
+        for e in screen_events(lc, windows_days=windows, k_mad=k, min_cadences=int(params.get("min_cadences", 2)),
+                               channels=_screen_channels(lc)):
             g = np.arange(e["start_index"], e["stop_index"] + 1)
             epoch = float(np.nanmedian(lc.time_bjd[g]))
             ev = {"detrend_days": e["detrend_days"], "flux_type": e["flux_type"], "start_index": e["start_index"],
@@ -256,6 +453,8 @@ def step_residual_screen(ctx, params: dict) -> dict:
                "time_max_stored": float(np.nanmax(lc.time[finite])), "bjdref": lc.bjdref,
                "time_scale": lc.table_header.get("TIMESYS"), "cadence_seconds_header": lc.cadence_s,
                "coordinate_convention": "header RA_OBJ/DEC_OBJ as supplied; frame not independently established",
+               "channel_mode": "single channel (no independent comparison)" if single else "SAP and PDCSAP",
+               "channels": _channel_info(lc),
                "threshold": {"k_mad": k, "source": k_src}}
         if events:
             res["screened_excursions"] = events
@@ -274,16 +473,27 @@ def step_residual_screen(ctx, params: dict) -> dict:
                                        + ("from the campaign's sign-flip calibration" if k_src.startswith("calibrated")
                                           else "is an uncalibrated screen unless calibrate_screen ran")
                                        + "; entries overlap across recipes and are not independent events.")
-        (sub / "screen.json").write_text(json.dumps(res, indent=2, allow_nan=False), encoding="utf-8")
         outside = [e for e in events if not e["inside_veto"]]
-        grouped = group_entries(outside, len(windows))
+        grouped = group_entries(outside, len(windows), single_channel=single)
+        try:
+            sysmod = systematics.product_summary(lc, lc.pdc, grouped,
+                                                 seed=int(ctx.seed or 0) + 1,
+                                                 n_random=int(params.get("rednoise_trials", 300)))
+        except Exception as exc:  # noqa: BLE001 - the noise model must not break the screen
+            sysmod = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        res["systematics_model"] = sysmod
+        (sub / "screen.json").write_text(json.dumps(res, indent=2, allow_nan=False), encoding="utf-8")
         summary[pid] = {"distinct_events_outside_veto": grouped,
                         "persistent_events_outside_veto": sum(g["persistent"] for g in grouped),"dir": ctx.rel(sub), "rows": res["rows"], "usable": res["usable"], "k_mad": k,
+                        "channel_mode": "single" if single else "SAP+PDCSAP",
+                        "systematics_model": sysmod,
                         **({} if k_src.startswith(("calibrated", "declared")) else {"threshold_note": k_src}),
                         "entries": len(events), "entries_outside_veto": len(outside),
                         "outside_veto": [{k2: e[k2] for k2 in ("detrend_days", "flux_type", "mid_time_BJD_like", "n_cadences",
                                                                "median_fractional_residual")} for e in outside]}
-        ctx.measure("screen_entries", len(events), unit="count", method=f"-{k} MAD, windows {list(windows)} d, SAP+PDCSAP", products=[pid])
+        ctx.measure("screen_entries", len(events), unit="count",
+                    method=f"-{k} MAD, windows {list(windows)} d, " +
+                           ("single channel (not independent)" if single else "SAP+PDCSAP"), products=[pid])
         ctx.measure("screen_entries_outside_veto", len(outside), unit="count", method="same, outside known-signal veto", products=[pid])
     n_out = sum(s["entries_outside_veto"] for s in summary.values())
     n_ev = sum(len(s["distinct_events_outside_veto"]) for s in summary.values())
@@ -291,6 +501,31 @@ def step_residual_screen(ctx, params: dict) -> dict:
     ctx.note(f"Residual screen: {n_out} threshold entr{'y' if n_out == 1 else 'ies'} outside the known-signal veto across "
              f"{len(summary)} light curve(s)" + (f", forming {n_ev} distinct event(s), {n_pers} persistent in SAP and PDCSAP at "
                                                  f"two or more baselines." if n_out else "."))
+    single_pids = [pid for pid, s in summary.items() if s.get("channel_mode") == "single"]
+    if single_pids:
+        strongest = None
+        for pid in single_pids:
+            st = (summary[pid].get("systematics_model") or {}).get("strongest")
+            fap_of = lambda s: 1.0 if s["trial_corrected_fap"] is None else s["trial_corrected_fap"]
+            if st and (strongest is None or fap_of(st) < fap_of(strongest)):
+                strongest = {**st, "product": pid}
+        if strongest is None:
+            ctx.check("Single-channel event significance (red noise)", "not_tested",
+                      f"{len(single_pids)} single-channel product(s); no event outside the veto to assess")
+        else:
+            fap = strongest["trial_corrected_fap"]
+            if fap is None:
+                ctx.check("Single-channel event significance (red noise)", "inconclusive",
+                          f"strongest {strongest['product']} event BJD {strongest['event_bjd']:.4f}: "
+                          "the red-noise model could not assign a parametric significance")
+            else:
+                state, empirical_agrees = significance_state(fap, strongest["empirical_p"], strongest["n_random"])
+                ctx.check("Single-channel event significance (red noise)", state,
+                          f"strongest {strongest['product']} event BJD {strongest['event_bjd']:.4f}: box "
+                          f"{strongest['box_statistic']:+.4f}, red-noise-inflated z "
+                          f"{strongest['parametric_z_rednoise_inflated']:+.1f}, empirical p {strongest['empirical_p']:.3g}, "
+                          f"FAP {fap:.3g} (n_eff {strongest['n_effective_trials']:.0f}, tau {strongest['tau_days']})"
+                          + ("" if empirical_agrees else "; the empirical random-epoch test does not confirm it"))
     if k_decl == "calibrated":
         cal = ctx.result("calibrate_screen")["per_product"]
         unc = [pid for pid in summary if cal.get(pid, {}).get("k_star") is None]
@@ -319,12 +554,9 @@ def step_bls_recovery(ctx, params: dict) -> dict:
     import astropy
     from astropy.timeseries import BoxLeastSquares
 
-    if (ex := _excluded(ctx)):
-        ctx.note(ex["exclusion"])
-        return {"excluded": True, "exclusion": ex["exclusion"]}
     pid = params["product"]
     prod = ctx.result("fetch_products")["products"][pid]
-    lc = read_spoc(resolve(prod["path"]))
+    lc = _read_lc(resolve(prod["path"]), prod)
     finite = np.isfinite(lc.time) & np.isfinite(lc.pdc) & (lc.pdc > 0)
     good = finite & (lc.quality == 0)
     t, f, s = lc.time[good], lc.pdc[good], lc.sap[good]
@@ -373,16 +605,19 @@ def step_bls_recovery(ctx, params: dict) -> dict:
 
 
 # ------------------------------------------------------------------ calibration (null + injection–recovery)
-def _persistent_intervals(lc, sap, pdc, finite, window_days, k, sign, veto_mask):
-    """Intervals flagged in BOTH SAP and PDCSAP at one baseline (the screen's persistence rule),
-    outside the veto. Returns a list of (start, stop) index pairs."""
+def _persistent_intervals(lc, sap, pdc, finite, window_days, k, sign, veto_mask, *, single=False):
+    """Intervals flagged at one baseline, outside the veto. Returns index pairs.
+
+    Multi-channel: flagged in BOTH SAP and PDCSAP (the persistence rule). Single-channel:
+    flagged in the one channel, with the loss of independence carried by the caller.
+    """
     flags = []
-    for flux in (sap, pdc):
+    for flux in ((pdc,) if single else (sap, pdc)):
         rr = local_resid(flux, finite, lc.cadence_s, window_days)
         sig = robust_sigma(rr[finite])
         hit = finite & np.isfinite(rr) & ((rr < -k * sig) if sign < 0 else (rr > k * sig))
         flags.append(hit)
-    both = flags[0] & flags[1] & ~veto_mask
+    both = flags[0] & flags[1] & ~veto_mask if not single else flags[0] & ~veto_mask
     return [(int(g[0]), int(g[-1])) for g in contiguous_runs(both, 2)]
 
 
@@ -397,10 +632,6 @@ def step_calibrate_screen(ctx, params: dict) -> dict:
       PDCSAP at random usable times outside the veto (seeded), recovered if a persistent dip interval
       overlaps the box. Completeness is reported at the declared threshold and at k*.
     """
-    if (ex := _excluded(ctx)):
-        ctx.check("Calibrated false-alarm threshold (sign-flip null)", "not_tested", ex["exclusion"])
-        ctx.check("Synthetic signal injection–recovery", "not_tested", ex["exclusion"])
-        return {"per_product": {}, "declared_k": float(params.get("declared_k", 5.0)), "excluded": True}
     veto = ctx.spec.get("veto")
     window = float(params.get("window_days", 2.0))
     grid = [float(x) for x in params.get("k_grid", [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 8.0])]
@@ -412,11 +643,12 @@ def step_calibrate_screen(ctx, params: dict) -> dict:
     ref = params.get("reference_signal", {"depth_ppm": 2000, "duration_h": 2.0})
     rng = np.random.default_rng(ctx.seed)
     per = {}
-    for pid, prod in ctx.result("fetch_products")["products"].items():
-        lc = read_spoc(resolve(prod["path"]))
+    for pid, prod in _lightcurve_products(ctx).items():
+        lc = _read_lc(resolve(prod["path"]), prod)
         finite = lc.usable
+        single = not _independent(lc)
         vmask, _ = _veto_mask(lc, veto, _target_for(ctx, pid))
-        null = {k: len(_persistent_intervals(lc, lc.sap, lc.pdc, finite, window, k, +1, vmask)) for k in grid}
+        null = {k: len(_persistent_intervals(lc, lc.sap, lc.pdc, finite, window, k, +1, vmask, single=single)) for k in grid}
         ok = [k for k in grid if null[k] <= max_null]
         k_star = min(ok) if ok else None
         at_floor = k_star is not None and k_star == min(grid)   # then k* is only an upper bound
@@ -449,7 +681,7 @@ def step_calibrate_screen(ctx, params: dict) -> dict:
                     if k is None:
                         cell[label] = None
                         continue
-                    found = _persistent_intervals(lc, sap, pdc, finite, window, k, -1, vmask)
+                    found = _persistent_intervals(lc, sap, pdc, finite, window, k, -1, vmask, single=single)
                     rec = sum(any(a <= b1 and b0 <= bb for a, bb in found) for b0, b1 in boxes)
                     cell[label] = rec / len(boxes) if boxes else None
                 comp[f"{int(dep)}ppm_{dur:g}h"] = {"depth_ppm": dep, "duration_h": dur, "n_injected": len(boxes), **cell}
@@ -461,10 +693,12 @@ def step_calibrate_screen(ctx, params: dict) -> dict:
                 depth90.setdefault(f"{dur:g}h", {})[label] = min(ok90) if ok90 else None
         per[pid] = {"null_events_by_k": {f"{k:g}": v for k, v in null.items()}, "k_star": k_star,
                     "k_star_at_grid_floor": at_floor, "depth_for_90pct_completeness_ppm": depth90, "completeness": comp,
+                    "channel_mode": "single" if single else "SAP+PDCSAP",
                     "reference": {"cell": refkey, **{lab: comp.get(refkey, {}).get(lab) for lab in ("declared", "calibrated")}}}
         ctx.measure("calibrated_k_mad", (f"<= {k_star:g}" if at_floor else k_star) if k_star is not None else "none on grid",
                     unit="robust sigma",
-                    method=f"sign-flip null, SAP∧PDCSAP at {window} d baseline, ≤{max_null} null events outside veto", products=[pid])
+                    method=f"sign-flip null, {'single channel' if single else 'SAP∧PDCSAP'} at {window} d baseline, "
+                           f"≤{max_null} null events outside veto", products=[pid])
         ctx.measure("null_events_at_declared_k", null.get(k_decl, "k not on grid"), unit="count",
                     method=f"sign-flip null at k={k_decl}", products=[pid])
         rc = per[pid]["reference"]
@@ -539,22 +773,26 @@ def step_known_signal_recovery(ctx, params: dict) -> dict:
     tol_d = float(params.get("epoch_tolerance_hours", 2.0)) / 24
     series_w = float(params.get("depth_window_days", 2.0))
     per, epochs_all = {}, []
-    for pid, prod in ctx.result("fetch_products")["products"].items():
-        lc = read_spoc(resolve(prod["path"]))
+    for pid, prod in _lightcurve_products(ctx).items():
+        lc = _read_lc(resolve(prod["path"]), prod)
         target = _target_for(ctx, pid) or {}
         k, k_src = _threshold(ctx, pid, k_decl)
         dur_h = target.get("duration_h") or veto.get("duration_h")
         dur_d = float(dur_h) / 24 if dur_h else 2 / 24
         cat_depth = target.get("depth_ppm") or veto.get("depth_ppm")
         epochs = _known_epochs(lc, veto, target)
+        single = not _independent(lc)
         entry = {"k_mad": k, "threshold_source": k_src, "target": target.get("name"),
+                 "channel_mode": "single" if single else "SAP+PDCSAP",
                  "catalogue": {"epoch_source": "target t0_bjd" if veto.get("kind") == "single_epoch" else veto.get("source"),
                                "depth_ppm": cat_depth, "duration_h": dur_h},
                  "time_span_bjd": [float(np.nanmin(lc.time_bjd)), float(np.nanmax(lc.time_bjd))], "epochs": []}
         if epochs:
-            events = screen_events(lc, windows_days=windows, k_mad=k, min_cadences=int(params.get("min_cadences", 2)))
+            events = screen_events(lc, windows_days=windows, k_mad=k, min_cadences=int(params.get("min_cadences", 2)),
+                                   channels=_screen_channels(lc))
             usable = lc.usable
             resid = local_resid(lc.pdc, usable, lc.cadence_s, series_w)
+            required = {label for label, _ in _screen_channels(lc)}
             for e in epochs:
                 inwin = np.abs(lc.time_bjd - e) <= dur_d / 2
                 n_in = int((inwin & usable).sum())
@@ -571,13 +809,14 @@ def step_known_signal_recovery(ctx, params: dict) -> dict:
                     if hits:
                         mids = [float(np.nanmedian(lc.time_bjd[ev["start_index"]:ev["stop_index"] + 1])) for ev in hits]
                         ep["entry_offset_hours"] = float(np.median(mids) - e) * 24
-                ep["state"] = ("gap" if n_in < 2 else "recovered" if fluxes == ["PDCSAP", "SAP"] else
+                ep["state"] = ("gap" if n_in < 2 else "recovered" if set(fluxes) >= required else
                                "partial" if hits else "not_recovered")
                 entry["epochs"].append(ep)
                 epochs_all.append((pid, ep))
         per[pid] = entry
         for ep in entry["epochs"]:
-            ctx.measure("known_epoch_state", ep["state"], method=f"-{k:g} MAD screen without veto, SAP and PDCSAP within "
+            ctx.measure("known_epoch_state", ep["state"], method=f"-{k:g} MAD screen without veto, "
+                        f"{'single channel' if single else 'SAP and PDCSAP'} within "
                         f"±(dur/2 + {tol_d * 24:g} h) of catalogued epoch {ep['epoch_bjd']:.5f}", products=[pid])
             if "measured_depth_ppm" in ep:
                 ctx.measure("known_transit_depth", ep["measured_depth_ppm"], unit="ppm",
@@ -637,8 +876,8 @@ def step_period_aliases(ctx, params: dict) -> dict:
     below = float(params.get("excluded_below", 0.3))
     # light curves and residuals once
     series = {}
-    for pid, prod in ctx.result("fetch_products")["products"].items():
-        lc = read_spoc(resolve(prod["path"]))
+    for pid, prod in _lightcurve_products(ctx).items():
+        lc = _read_lc(resolve(prod["path"]), prod)
         series[pid] = (lc.time_bjd, lc.usable, local_resid(lc.pdc, lc.usable, lc.cadence_s, 2.0))
     cands = []
     for pid, v in screen.items():
@@ -706,7 +945,7 @@ def step_period_aliases(ctx, params: dict) -> dict:
 # ------------------------------------------------------------------ prior art
 def step_prior_art(ctx, params: dict) -> dict:
     """Catalogue cross-match for every campaign target through the Known-Object Gate adapters."""
-    from ..priorart import catalogue_audit
+    from cygnus.priorart import catalogue_audit
 
     targets = ctx.targets()
     radius = float(params.get("radius_arcsec", 30.0))
@@ -728,7 +967,7 @@ def step_prior_art(ctx, params: dict) -> dict:
 
 # ------------------------------------------------------------------ target queue
 def step_target_queue(ctx, params: dict) -> dict:
-    from ..targets import build_queue
+    from cygnus.targets import build_queue
 
     q = build_queue(params)
     path = ctx.outdir / "target_queue.csv"
@@ -741,9 +980,177 @@ def step_target_queue(ctx, params: dict) -> dict:
     return {**q, "csv": ctx.rel(path)}
 
 
+# ------------------------------------------------------------------ context products
+def step_context_products(ctx, params: dict) -> dict:
+    """Record the non-light-curve products a multi-archive fetch retrieved.
+
+    A campaign that names several archives usually gets context as well as time
+    series: Gaia neighbours, a SkyView/Legacy cutout, NED matches. Those are read
+    (so a malformed file is caught) and summarised — row counts, image shapes,
+    byte sizes — but they are never screened as light curves. Writes
+    ``context.json``; the check is ``not_tested`` when the campaign fetched no
+    context products, rather than ``passed`` on an empty set.
+    """
+    from .readers import read_product
+
+    prods = ctx.result("fetch_products")["products"]
+    others = {pid: p for pid, p in prods.items() if p.get("kind") != "lightcurve"}
+    out = {}
+    for pid, p in others.items():
+        entry = {"archive": p["archive"], "format": p["format"], "kind": p.get("kind"),
+                 "description": p.get("description", ""), "bytes": p.get("bytes"), "sha256": p.get("sha256")}
+        try:
+            obj = read_product(resolve(p["path"]), fmt=p["format"])
+            if isinstance(obj, dict) and "rows" in obj:
+                entry.update({"n_rows": int(obj["rows"] if isinstance(obj["rows"], int) else len(obj["rows"])),
+                              "columns": [str(c) for c in obj.get("columns", [])][:20]})
+            elif isinstance(obj, dict) and "shape" in obj:
+                entry.update({"image_shape": [int(s) for s in obj["shape"]]})
+            elif isinstance(obj, dict) and "text" in obj:
+                entry.update({"text_bytes": len(obj["text"])})
+            else:
+                entry.update({"object": type(obj).__name__})
+        except Exception as exc:  # noqa: BLE001 - a context product that will not read is recorded as such
+            entry["read_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        out[pid] = entry
+        ctx.measure("context_product_bytes", int(p.get("bytes") or 0), unit="byte",
+                    method="fetched context product size", products=[pid])
+    (ctx.outdir / "context.json").write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
+    if others:
+        kinds = sorted({v["kind"] for v in others.values()})
+        errs = [pid for pid, v in out.items() if "read_error" in v]
+        ctx.check("Context products read", "passed" if not errs else "inconclusive",
+                  f"{len(others)} non-light-curve product(s) ({', '.join(kinds)}) recorded in context.json"
+                  + (f"; {len(errs)} failed to read: {', '.join(errs[:3])}" if errs else ""))
+    else:
+        ctx.check("Context products read", "not_tested", "the campaign fetched no non-light-curve products")
+    return {"products": out, "file": ctx.rel(ctx.outdir / "context.json")}
+
+
+# ------------------------------------------------------------------ per-source checks
+def _aggregate_state(states: list[str]) -> str:
+    if not states:
+        return "not_tested"
+    for s in ("failed", "inconclusive", "not_tested"):
+        if s in states:
+            return s
+    return "passed"
+
+
+def step_source_checks(ctx, params: dict) -> dict:
+    """Run each archive adapter's own checks on its fetched products.
+
+    This is where per-source vetting lives: Gaia returns astrometric fidelity
+    flags, MAST its quality-flag census, MPC the observation count from its data
+    API, catalogue adapters the nearest match, image archives the finite-pixel and
+    background census. One check per archive is written to the sky record; the full
+    per-product detail goes to ``source_checks.json``. An archive with no
+    registered adapter, or a check that raises, is recorded as not tested or
+    inconclusive — never passed.
+    """
+    from .archives import base as _base
+
+    prods = ctx.result("fetch_products")["products"]
+    out: dict[str, list[dict]] = {}
+    by_archive: dict[str, list[str]] = {}
+    for pid, p in prods.items():
+        archive = p.get("archive") or "MAST"
+        fmt = p.get("format") or "spoc_lc"
+        try:
+            adapter = _base.get(archive.lower() if archive.lower() in _base.available() else archive)
+        except KeyError:
+            checks = [{"name": f"{archive} adapter", "state": "not_tested", "note": "no adapter registered"}]
+        else:
+            target = _target_for(ctx, pid)
+            tgt = _base.Target.from_mapping(target) if target else None
+            ref = _base.ProductRef(archive=archive, product_id=pid, url=p.get("url"), format=fmt,
+                                   kind=p.get("kind") or _base.kind_for_format(fmt),
+                                   expected_sha256=p.get("sha256"))
+            try:
+                checks = [c.as_dict() for c in adapter.source_checks(tgt, ref, resolve(p["path"]), p)]
+            except Exception as exc:  # noqa: BLE001
+                checks = [{"name": f"{archive} source checks", "state": "inconclusive",
+                           "note": f"{type(exc).__name__}: {str(exc)[:200]}"}]
+        if p.get("truncated"):
+            checks.append({"name": f"{archive} row cap", "state": "inconclusive", "note": p["truncated"]})
+        out[pid] = checks
+        by_archive.setdefault(archive, []).extend(c["state"] for c in checks)
+        for c in checks:
+            ctx.measure("source_check", c["state"], method=f"{archive}: {c['name']}", products=[pid], notes=c.get("note"))
+    (ctx.outdir / "source_checks.json").write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
+    for archive, states in sorted(by_archive.items()):
+        state = _aggregate_state(states)
+        n_pass = sum(1 for s in states if s == "passed")
+        failing = [f"{pid}:{c['name']}" for pid, cs in out.items() for c in cs
+                   if c["state"] != "passed" and (prods[pid].get("archive") or "MAST") == archive]
+        ctx.check(f"Source checks ({archive})", state,
+                  f"{n_pass}/{len(states)} passed"
+                  + (f"; non-passing: {', '.join(failing[:4])}" if failing else ""))
+    return {"products": out, "file": ctx.rel(ctx.outdir / "source_checks.json")}
+
+
+# ------------------------------------------------------------------ astrometric vetting (Gaia NSS)
+def step_astrometric_vetting(ctx, params: dict) -> dict:
+    """Cross-match every campaign target against Gaia DR3 NSS two-body solutions.
+
+    This is source-scientific vetting rather than an integrity check: a significant
+    NSS solution means the companion is already known to Gaia, which refutes a
+    new-unseen-companion hypothesis for that target (state ``failed``). No solution
+    is reported ``inconclusive`` — Gaia sensitivity is incomplete, so absence is not
+    proof of a single star. Writes ``nss.json``; unavailable Gaia is ``not_tested``.
+    """
+    from . import nss as _nss
+    from .archives import base as _base
+
+    radius = float(params.get("radius_arcsec", 5.0))
+    sig_min = float(params.get("significance_min", 5.0))
+    max_sol = int(params.get("max_solutions", 10))
+    out: dict[str, dict] = {}
+    states: list[str] = []
+    for t in ctx.targets():
+        target = _base.Target.from_mapping(t)
+        try:
+            res = _nss.nss_vetting(_base.get("gaia"), target, radius_arcsec=radius, significance_min=sig_min,
+                                   max_solutions=max_sol)
+        except _base.AdapterUnavailable as exc:
+            res = {"state": "not_tested", "note": f"Gaia unavailable: {exc}", "solutions": [], "nss_solutions": 0}
+        except Exception as exc:  # noqa: BLE001
+            res = {"state": "not_tested", "note": f"{type(exc).__name__}: {str(exc)[:200]}",
+                   "solutions": [], "nss_solutions": 0}
+        out[t["name"]] = res
+        states.append(res["state"])
+        if res.get("nss_solutions"):
+            ctx.measure("nss_solutions", res["nss_solutions"], unit="count",
+                        method="Gaia DR3 nss_two_body_orbit cross-match", notes=res.get("note"))
+        if res.get("top_mass_function_msun") is not None:
+            ctx.measure("nss_spectroscopic_mass_function", res["top_mass_function_msun"], unit="Msun",
+                        method="f(M) = P K1^3 (1-e^2)^1.5 / (2 pi G) from NSS period, K1 and e")
+    (ctx.outdir / "nss.json").write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
+    ids = []
+    for name, r in out.items():
+        m = r.get("target_match")
+        if not m:
+            ids.append(("not_tested", f"{name}: no Gaia DR3 source matched"))
+            continue
+        dg = m.get("min_delta_g_to_others")
+        ids.append(("passed" if m.get("identification") == "unique" else "inconclusive",
+                    f"{name}: Gaia DR3 {m['source_id']} at {m['sep_arcsec']:.2f}\", G {m.get('phot_g_mean_mag')}; "
+                    f"{m['n_sources_in_radius']} source(s) within {radius:g}\""
+                    + (f", nearest other ΔG {dg:.2f}" if dg is not None else "")))
+    ctx.check("Target-to-Gaia source identification", _aggregate_state([st for st, _ in ids]),
+              "; ".join(n for _, n in ids)[:900])
+    state = _aggregate_state(states)
+    ctx.check("Gaia NSS astrometric vetting", state,
+              "; ".join(f"{name}: {r['note']}" for name, r in out.items())[:900])
+    return {"targets": out, "file": ctx.rel(ctx.outdir / "nss.json")}
+
+
 STEPS: dict[str, Callable[[Any, dict], dict]] = {
     "target_queue": step_target_queue,
     "fetch_products": step_fetch_products,
+    "context_products": step_context_products,
+    "source_checks": step_source_checks,
+    "astrometric_vetting": step_astrometric_vetting,
     "calibrate_screen": step_calibrate_screen,
     "residual_screen": step_residual_screen,
     "bls_recovery": step_bls_recovery,

@@ -4,7 +4,7 @@ Contract (docs/CAMPAIGNS.md):
 
 * the spec (``schema: cygnus.campaign/1``) is the single source of the run's parameters; steps read
   nothing that is hard-coded per campaign;
-* every step runs inside ``Ledger.recorded_run`` (script ``cygnus.campaign:<id>:<step>``) and so is
+* every step runs inside ``Ledger.recorded_run`` (script ``cygnus_multi:<id>:<step>``) and so is
   always closed completed / failed / aborted; measurements go to the ledger;
 * a step whose config hash (its params, the spec's shared blocks, upstream outputs, code version)
   matches a completed run with a saved output is reused, not recomputed (``--force`` overrides);
@@ -20,9 +20,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ..config import WORKTREE, scratch_dir
-from ..ledger import Ledger, now_utc
-from ..skyrecord import SCHEMA as RECORD_SCHEMA
+from cygnus.config import WORKTREE, scratch_dir
+from cygnus.ledger import Ledger, now_utc
+from cygnus.skyrecord import SCHEMA as RECORD_SCHEMA, known_positions, validate
 from .steps import STEPS
 
 SPEC_SCHEMA = "cygnus.campaign/1"
@@ -33,20 +33,6 @@ class SpecError(ValueError):
     pass
 
 
-MULTI_RUNNER = "cygnus.multi"
-
-
-def spec_runner(path: str | Path) -> str | None:
-    """The spec's declared ``runner`` (``cygnus.multi`` for multi-archive specs), or None."""
-    import yaml
-
-    try:
-        spec = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
-        return None
-    return spec.get("runner") if isinstance(spec, dict) else None
-
-
 def load_spec(path: str | Path) -> dict:
     import yaml
 
@@ -55,9 +41,6 @@ def load_spec(path: str | Path) -> dict:
     problems = []
     if not isinstance(spec, dict) or spec.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"{path}: schema must be {SPEC_SCHEMA!r}")
-    if spec.get("runner") not in (None, "cygnus.campaign"):
-        raise SpecError(f"{path}: runner is {spec['runner']!r}; run it with `python -m {spec['runner']}` "
-                        "(`python -m cygnus.campaign` hands such specs over automatically)")
     if not SLUG.match(str(spec.get("campaign_id", ""))):
         problems.append("campaign_id must be a slug")
     steps = spec.get("steps") or []
@@ -68,28 +51,19 @@ def load_spec(path: str | Path) -> dict:
         name = next(iter(s))
         if name not in STEPS:
             problems.append(f"step {name!r} is not implemented (known: {', '.join(STEPS)})")
+    if spec.get("runner") not in (None, "cygnus.multi"):
+        problems.append(f"runner is {spec['runner']!r}; this runner is cygnus.multi")
     order = [next(iter(s)) for s in steps if isinstance(s, dict) and len(s) == 1]
-    for dep in ("calibrate_screen", "residual_screen", "known_signal_recovery", "bls_recovery", "period_aliases"):
+    for dep in ("context_products", "source_checks", "calibrate_screen", "residual_screen", "known_signal_recovery",
+                "bls_recovery", "period_aliases"):
         if dep in order and "fetch_products" not in order:
             problems.append(f"{dep} needs a fetch_products step before it")
-        elif dep in order and "fetch_products" in order and order.index(dep) < order.index("fetch_products"):
+        elif dep in order and order.index(dep) < order.index("fetch_products"):
             problems.append(f"{dep} must come after fetch_products")
     for s in steps:
-        if not (isinstance(s, dict) and len(s) == 1):
-            continue
-        name = next(iter(s))
-        params = next(iter(s.values())) or {}
-        if not isinstance(params, dict):
-            continue
-        if name in ("residual_screen", "known_signal_recovery"):
-            k = params.get("k_mad", "calibrated" if name == "known_signal_recovery" else None)
-            if str(k).lower() == "calibrated":
-                if "calibrate_screen" not in order:
-                    problems.append(f"{name}: k_mad 'calibrated' requires a calibrate_screen step")
-                elif order.index("calibrate_screen") > order.index(name):
-                    problems.append(f"{name}: calibrate_screen must come before it to provide k*")
-    if "fetch_products" in order and "target_queue" in order and order.index("target_queue") > order.index("fetch_products"):
-        problems.append("target_queue must come before fetch_products")
+        if isinstance(s, dict) and len(s) == 1 and next(iter(s)) == "residual_screen":
+            if (next(iter(s.values())) or {}).get("k_mad") == "calibrated" and "calibrate_screen" not in order:
+                problems.append("residual_screen k_mad: calibrated needs a calibrate_screen step")
     if "outputs" not in spec:
         problems.append("outputs directory required")
     veto = spec.get("veto")
@@ -105,8 +79,8 @@ def load_spec(path: str | Path) -> dict:
 
 def code_fingerprint() -> str:
     """Hash of the source files that define campaign behaviour, so a code change invalidates reuse."""
-    pkg = Path(__file__).resolve().parents[1]
-    files = sorted((pkg / "campaign").glob("*.py")) + [pkg / "targets.py", pkg / "priorart.py"]
+    pkg = Path(__file__).resolve().parent
+    files = sorted(pkg.glob("*.py")) + sorted((pkg / "archives").glob("*.py"))
     h = hashlib.sha256()
     for f in files:
         h.update(f.name.encode())
@@ -174,15 +148,15 @@ class Context:
     def product_dir(self, pid: str, lc=None) -> Path:
         prod = self._results["fetch_products"]["products"][pid]
         sector = prod.get("sector") or (lc.primary.get("SECTOR") if lc is not None else None)
-        sub = self.outdir / (f"tic{prod['tic']}" if prod.get("tic") and prod.get("target") else "") / f"sector{int(sector):02d}"
+        # non-TESS archives carry no sector; label the folder by archive so outputs are still distinct
+        tag = f"sector{int(sector):02d}" if sector is not None else f"{(prod.get('archive') or 'other').lower()}00"
+        sub = self.outdir / (f"tic{prod['tic']}" if prod.get("tic") and prod.get("target") else "") / tag
         sub.mkdir(parents=True, exist_ok=True)
         return sub
 
     def targets(self) -> list[dict]:
         """Campaign targets with positions: the spec's ``targets`` (resolved via NAME_RESOLUTIONS when
         no position is given) plus the queued targets if a target_queue step ran."""
-        from ..skyrecord import known_positions
-
         pos = known_positions(self.root)
         out = []
         for t in self.spec.get("targets", []):
@@ -212,7 +186,7 @@ def run(spec_path: str | Path, *, ledger: Ledger, root: Path = WORKTREE, force: 
         ctx.step = name
         cfg = _hash({"step": name, "params": params, "shared": shared, "upstream": upstream,
                      "code": ledger.code_version, "source": source})
-        script = f"cygnus.campaign:{ctx.campaign_id}:{name}"
+        script = f"cygnus_multi:{ctx.campaign_id}:{name}"
         saved = state_dir / f"{name}.json"
         prior = None if force else ledger.completed_run(script, cfg)
         if prior and saved.is_file():
@@ -275,7 +249,9 @@ def write_record(ctx: Context, complete: bool) -> str | None:
     for t in ctx.optional_result("target_queue", {}).get("queue", [])[:n]:
         targets.append({"name": t["name"], "ra_deg": t["ra_deg"], "dec_deg": t["dec_deg"], "frame": "ICRS",
                         "epoch": "J2000.0 (TIC)", "position_source": "NASA Exoplanet Archive TOI table"})
-    products = [{"id": pid, "archive": "MAST", "sha256": p["sha256"]}
+    products = [{"id": pid, "archive": p.get("archive", "MAST"), "sha256": p["sha256"],
+                 **({"url": p["url"]} if p.get("url") else {}),
+                 **({"format": p["format"]} if p.get("format") else {})}
                 for pid, p in ctx.optional_result("fetch_products", {}).get("products", {}).items()]
     summary = rec_spec["summary"].strip()
     if ctx.notes and rec_spec.get("append_runner_notes", True):
@@ -289,9 +265,17 @@ def write_record(ctx: Context, complete: bool) -> str | None:
            "date": (rec_spec.get("date") or now_utc()[:10]) if status != "draft" else None,
            "summary": summary, "spec": ctx.rel(ctx.spec["_path"]), "report": rec_spec.get("report"),
            "search_log": rec_spec.get("search_log"), "targets": targets, "products": products, "checks": checks,
-           "generated_by": "cygnus.campaign runner", "generated_utc": now_utc()}
+           "generated_by": "cygnus_multi campaign runner", "generated_utc": now_utc()}
     if rec_spec.get("plots"):
         rec["plots"] = rec_spec["plots"]
-    path = ctx.root / rec_spec.get("path", ctx.rel(ctx.outdir / "sky_record.json"))
+    path = (ctx.root / rec_spec.get("path", ctx.rel(ctx.outdir / "sky_record.json"))).resolve()
+    if not path.is_relative_to(ctx.root.resolve()):
+        raise RuntimeError(f"record.path {rec_spec.get('path')!r} resolves outside the campaign root")
+    # the report and search log are written after the run (``report``), so only their paths may be missing now
+    pending = tuple(f"{k} path does not exist" for k in ("report", "search_log"))
+    problems = [m for m in validate({**rec, "_path": ctx.rel(path)}, ctx.root, known_positions(ctx.root))
+                if not any(x in m for x in pending)]
+    if problems:
+        raise RuntimeError("sky record fails cygnus.skyrecord.validate:\n  " + "\n  ".join(problems))
     path.write_text(json.dumps(rec, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
     return ctx.rel(path)
